@@ -22,6 +22,7 @@ def init_db():
             media_file_id TEXT,
             media_type TEXT NOT NULL DEFAULT 'photo',
             caption TEXT NOT NULL,
+            caption_entities TEXT,
             scheduled_time TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -31,14 +32,15 @@ def init_db():
     conn.close()
 
 
-def add_post(caption: str, scheduled_time: datetime, media_file_id: str = None, media_type: str = "none") -> int:
+def add_post(caption: str, scheduled_time: datetime, media_file_id: str = None, media_type: str = "none", caption_entities: str = None) -> int:
     """Add a new scheduled post. Returns the post ID.
     media_type can be: 'photo', 'video', or 'none'
+    caption_entities is a JSON string of Telegram MessageEntity objects
     """
     conn = get_connection()
     cursor = conn.execute(
-        "INSERT INTO scheduled_posts (media_file_id, media_type, caption, scheduled_time) VALUES (?, ?, ?, ?)",
-        (media_file_id, media_type, caption, scheduled_time.isoformat()),
+        "INSERT INTO scheduled_posts (media_file_id, media_type, caption, caption_entities, scheduled_time) VALUES (?, ?, ?, ?, ?)",
+        (media_file_id, media_type, caption, caption_entities, scheduled_time.isoformat()),
     )
     post_id = cursor.lastrowid
     conn.commit()

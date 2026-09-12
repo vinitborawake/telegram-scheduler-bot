@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 from datetime import datetime, timedelta
@@ -274,15 +275,22 @@ async def skip_media(update: Update, context):
 async def receive_text(update: Update, context):
     user_id = update.effective_user.id
 
-    # Use text_html to preserve ALL formatting: bold, italic, links, premium/custom emoji
-    if update.message.text_html:
-        caption = update.message.text_html
-    else:
-        caption = update.message.text
+    # Store RAW text + entities (not HTML) to perfectly preserve premium emoji
+    caption = update.message.text
+    entities = update.message.entities
 
     user_data_store[user_id]["caption"] = caption
 
-    # Show preview
+    # Serialize entities to JSON for database storage
+    if entities:
+        entities_json = json.dumps([e.to_dict() for e in entities])
+        user_data_store[user_id]["caption_entities"] = entities_json
+    else:
+        user_data_store[user_id]["caption_entities"] = None
+
+    # Use text_html for preview display only
+    preview = update.message.text_html if update.message.text_html else caption
+
     media_type = user_data_store[user_id].get("media_type", "none")
     media_label = {"photo": "📸 Photo", "video": "📹 Video", "none": "📝 Text-only"}.get(media_type, "📝 Text-only")
 
@@ -290,7 +298,7 @@ async def receive_text(update: Update, context):
         "✅ Caption saved!\n\n"
         f"👁️ <b>Preview:</b>\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"{caption}\n"
+        f"{preview}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📎 Media: {media_label}\n\n"
         "🕐 <b>Pick the date to publish:</b>",
@@ -397,6 +405,7 @@ async def handle_minute_pick(update: Update, context):
         scheduled_time=scheduled_time,
         media_file_id=data.get("media_file_id"),
         media_type=data.get("media_type", "none"),
+        caption_entities=data.get("caption_entities"),
     )
 
     # Schedule the job
@@ -462,6 +471,7 @@ async def receive_time_text(update: Update, context):
         scheduled_time=scheduled_time,
         media_file_id=data.get("media_file_id"),
         media_type=data.get("media_type", "none"),
+        caption_entities=data.get("caption_entities"),
     )
 
     sched_module.schedule_post(post_id, scheduled_time)
