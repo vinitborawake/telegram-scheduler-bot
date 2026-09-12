@@ -19,7 +19,8 @@ def init_db():
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scheduled_posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            image_file_id TEXT NOT NULL,
+            media_file_id TEXT,
+            media_type TEXT NOT NULL DEFAULT 'photo',
             caption TEXT NOT NULL,
             scheduled_time TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
@@ -30,12 +31,14 @@ def init_db():
     conn.close()
 
 
-def add_post(image_file_id: str, caption: str, scheduled_time: datetime) -> int:
-    """Add a new scheduled post. Returns the post ID."""
+def add_post(caption: str, scheduled_time: datetime, media_file_id: str = None, media_type: str = "none") -> int:
+    """Add a new scheduled post. Returns the post ID.
+    media_type can be: 'photo', 'video', or 'none'
+    """
     conn = get_connection()
     cursor = conn.execute(
-        "INSERT INTO scheduled_posts (image_file_id, caption, scheduled_time) VALUES (?, ?, ?)",
-        (image_file_id, caption, scheduled_time.isoformat()),
+        "INSERT INTO scheduled_posts (media_file_id, media_type, caption, scheduled_time) VALUES (?, ?, ?, ?)",
+        (media_file_id, media_type, caption, scheduled_time.isoformat()),
     )
     post_id = cursor.lastrowid
     conn.commit()

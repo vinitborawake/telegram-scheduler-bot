@@ -82,12 +82,32 @@ async def publish_post(post_id: int):
         return
 
     try:
-        await bot.send_photo(
-            chat_id=config.CHANNEL_ID,
-            photo=post["image_file_id"],
-            caption=post["caption"],
-            parse_mode="HTML",
-        )
+        media_type = post.get("media_type", "photo")
+        caption = post["caption"]
+        media_file_id = post.get("media_file_id")
+
+        if media_type == "photo" and media_file_id:
+            await bot.send_photo(
+                chat_id=config.CHANNEL_ID,
+                photo=media_file_id,
+                caption=caption,
+                parse_mode="HTML",
+            )
+        elif media_type == "video" and media_file_id:
+            await bot.send_video(
+                chat_id=config.CHANNEL_ID,
+                video=media_file_id,
+                caption=caption,
+                parse_mode="HTML",
+            )
+        else:
+            # Text-only post
+            await bot.send_message(
+                chat_id=config.CHANNEL_ID,
+                text=caption,
+                parse_mode="HTML",
+            )
+
         database.mark_posted(post_id)
         logger.info("✅ Published post #%d to channel %s", post_id, config.CHANNEL_ID)
 
