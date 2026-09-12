@@ -1,10 +1,12 @@
 import logging
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 
 import pytz
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ConversationHandler,
     MessageHandler,
@@ -33,11 +35,137 @@ user_data_store: dict = {}
 def admin_only(func):
     """Decorator to restrict commands to the admin user."""
     async def wrapper(update: Update, context):
-        if update.effective_user.id != config.ADMIN_USER_ID:
-            await update.message.reply_text("⛔ You are not authorized to use this bot.")
+        user = update.effective_user
+        if not user or user.id != config.ADMIN_USER_ID:
+            msg = update.message or update.callback_query.message
+            if update.message:
+                await update.message.reply_text("⛔ You are not authorized to use this bot.")
             return ConversationHandler.END
         return await func(update, context)
     return wrapper
+
+
+def get_tz():
+    return pytz.timezone(config.TIMEZONE)
+
+
+def get_now():
+    return datetime.now(get_tz())
+
+
+# ── Date/Time picker keyboards ──────────────────────────────────────────
+def build_date_keyboard():
+    """Build inline keyboard with date options."""
+    tz = get_tz()
+    now = datetime.now(tz)
+    buttons = []
+
+    # Row 1: Today & Tomorrow
+    today_label = f"📅 Today ({now.strftime('%b %d')})"
+    tomorrow = now + timedelta(days=1)
+    tomorrow_label = f"📅 Tomorrow ({tomorrow.strftime('%b %d')})"
+    buttons.append([
+        InlineKeyboardButton(today_label, callback_data=f"date_{now.strftime('%Y-%m-%d')}"),
+        InlineKeyboardButton(tomorrow_label, callback_data=f"date_{tomorrow.strftime('%Y-%m-%d')}"),
+    ])
+
+    # Row 2-3: Next 5 days
+    row = []
+    for i in range(2, 7):
+        day = now + timedelta(days=i)
+        label = day.strftime("%a %b %d")
+        row.append(InlineKeyboardButton(label, callback_data=f"date_{day.strftime('%Y-%m-%d')}"))
+        if len(row) == 3:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_hour_keyboard():
+    """Build inline keyboard with hour options."""
+    buttons = []
+    row = []
+    for h in range(0, 24):
+        if h == 0:
+            label = "12 AM"
+        elif h < 12:
+            label = f"{h} AM"
+        elif h == 12:
+            label = "12 PM"
+        else:
+            label = f"{h - 12} PM"
+        row.append(InlineKeyboardButton(label, callback_data=f"hour_{h}"))
+        if len(row) == 4:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_minute_keyboard():
+    """Build inline keyboard with minute options."""
+    buttons = []
+    minutes = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]
+    row = []
+    for m in minutes:
+        label = f":{m:02d}"
+        row.append(InlineKeyboardButton(label, callback_data=f"min_{m}"))
+        if len(row) == 4:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
+# ── Natural language time parser ─────────────────────────────────────────
+def parse_natural_time(text: str) -> datetime | None:
+    """Parse natural language time like 'today 3pm', 'tomorrow 10:30am', 'in 2h'."""
+    text = text.strip().lower()
+    tz = get_tz()
+    now = datetime.now(tz)
+
+    # "in Xh" or "in Xm" or "in X hours" or "in X min"
+    match = re.match(r"in\s+(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)", text)
+    if match:
+        amount = int(match.group(1))
+        unit = match.group(2)
+        if unit.startswith("h"):
+            return now + timedelta(hours=amount)
+        else:
+            return now + timedelta(minutes=amount)
+
+    # "today 3pm", "today 15:30", "tomorrow 10:30am"
+    match = re.match(r"(today|tomorrow)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", text)
+    if match:
+        day_word = match.group(1)
+        hour = int(match.group(2))
+        minute = int(match.group(3)) if match.group(3) else 0
+        ampm = match.group(4)
+
+        if ampm == "pm" and hour != 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+
+        target = now if day_word == "today" else now + timedelta(days=1)
+        try:
+            return target.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        except ValueError:
+            return None
+
+    # Standard format "YYYY-MM-DD HH:MM"
+    try:
+        dt = datetime.strptime(text, "%Y-%m-%d %H:%M")
+        return tz.localize(dt)
+    except ValueError:
+        pass
+
+    return None
 
 
 # ── /start command ───────────────────────────────────────────────────────
@@ -66,8 +194,12 @@ async def cmd_help(update: Update, context):
         "2️⃣ Send a 📸 photo, 📹 video, or /skip for text-only\n"
         "3️⃣ Type the caption/text for the post\n"
         "   ✨ <i>Premium emoji, bold, italic, links — all preserved!</i>\n"
-        "4️⃣ Enter date &amp; time:\n"
-        f"   <code>YYYY-MM-DD HH:MM</code>  (Timezone: {tz})\n\n"
+        "4️⃣ Pick date &amp; time using <b>buttons</b> or type:\n"
+        "   • <code>today 3pm</code>\n"
+        "   • <code>tomorrow 10:30am</code>\n"
+        "   • <code>in 2h</code> or <code>in 30m</code>\n"
+        f"   • <code>2026-09-15 14:30</code>\n\n"
+        f"⏰ Timezone: {tz}\n\n"
         "📋 /list — See all scheduled posts\n"
         "❌ /cancel <code>&lt;id&gt;</code> — Cancel a post by ID\n"
         "🚫 /done — Cancel current operation",
@@ -92,7 +224,6 @@ async def cmd_newpost(update: Update, context):
 @admin_only
 async def receive_photo(update: Update, context):
     user_id = update.effective_user.id
-    # Get the largest photo size (best quality)
     photo = update.message.photo[-1]
     user_data_store[user_id]["media_file_id"] = photo.file_id
     user_data_store[user_id]["media_type"] = "photo"
@@ -125,7 +256,6 @@ async def receive_video(update: Update, context):
 
 @admin_only
 async def skip_media(update: Update, context):
-    """Skip media for a text-only post."""
     user_id = update.effective_user.id
     user_data_store[user_id]["media_file_id"] = None
     user_data_store[user_id]["media_type"] = "none"
@@ -163,40 +293,165 @@ async def receive_text(update: Update, context):
         f"{caption}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📎 Media: {media_label}\n\n"
-        "🕐 Now <b>send the date and time</b> to publish.\n"
-        f"Format: <code>YYYY-MM-DD HH:MM</code>\n"
-        f"Example: <code>2026-09-15 14:30</code>\n"
-        f"<i>(Timezone: {config.TIMEZONE})</i>\n\n"
-        "<i>(Send /done to cancel)</i>",
+        "🕐 <b>Pick the date to publish:</b>",
         parse_mode="HTML",
+        reply_markup=build_date_keyboard(),
     )
     return WAITING_TIME
 
 
-@admin_only
-async def receive_time(update: Update, context):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
+async def handle_date_pick(update: Update, context):
+    """Handle date button tap."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
 
-    # Parse the datetime
-    tz = pytz.timezone(config.TIMEZONE)
-    try:
-        scheduled_time = datetime.strptime(text, "%Y-%m-%d %H:%M")
-        scheduled_time = tz.localize(scheduled_time)
-    except ValueError:
-        await update.message.reply_text(
-            "❌ Invalid format! Please use: <code>YYYY-MM-DD HH:MM</code>\n"
-            "Example: <code>2026-09-15 14:30</code>",
-            parse_mode="HTML",
-        )
-        return WAITING_TIME
+    if user_id != config.ADMIN_USER_ID:
+        return
+
+    date_str = query.data.replace("date_", "")
+    user_data_store[user_id]["selected_date"] = date_str
+
+    # Parse date for display
+    selected = datetime.strptime(date_str, "%Y-%m-%d")
+    date_display = selected.strftime("%b %d, %Y")
+
+    await query.edit_message_text(
+        f"📅 Date: <b>{date_display}</b>\n\n"
+        "🕐 <b>Now pick the hour:</b>",
+        parse_mode="HTML",
+        reply_markup=build_hour_keyboard(),
+    )
+    return WAITING_TIME
+
+
+async def handle_hour_pick(update: Update, context):
+    """Handle hour button tap."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    if user_id != config.ADMIN_USER_ID:
+        return
+
+    hour = int(query.data.replace("hour_", ""))
+    user_data_store[user_id]["selected_hour"] = hour
+
+    # Format hour for display
+    if hour == 0:
+        hour_display = "12 AM"
+    elif hour < 12:
+        hour_display = f"{hour} AM"
+    elif hour == 12:
+        hour_display = "12 PM"
+    else:
+        hour_display = f"{hour - 12} PM"
+
+    date_str = user_data_store[user_id]["selected_date"]
+    selected = datetime.strptime(date_str, "%Y-%m-%d")
+    date_display = selected.strftime("%b %d, %Y")
+
+    await query.edit_message_text(
+        f"📅 Date: <b>{date_display}</b>\n"
+        f"🕐 Hour: <b>{hour_display}</b>\n\n"
+        "⏱️ <b>Now pick the minutes:</b>",
+        parse_mode="HTML",
+        reply_markup=build_minute_keyboard(),
+    )
+    return WAITING_TIME
+
+
+async def handle_minute_pick(update: Update, context):
+    """Handle minute button tap — finalize scheduling."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    if user_id != config.ADMIN_USER_ID:
+        return ConversationHandler.END
+
+    minute = int(query.data.replace("min_", ""))
+    data = user_data_store[user_id]
+    date_str = data["selected_date"]
+    hour = data["selected_hour"]
+
+    # Build the final datetime
+    tz = get_tz()
+    scheduled_time = datetime.strptime(f"{date_str} {hour}:{minute}", "%Y-%m-%d %H:%M")
+    scheduled_time = tz.localize(scheduled_time)
 
     # Check if time is in the future
     now = datetime.now(tz)
     if scheduled_time <= now:
-        await update.message.reply_text(
-            "❌ That time is in the past! Please send a <b>future</b> date and time.",
+        await query.edit_message_text(
+            "❌ That time is in the past! Let's try again.\n\n"
+            "🕐 <b>Pick the date to publish:</b>",
             parse_mode="HTML",
+            reply_markup=build_date_keyboard(),
+        )
+        return WAITING_TIME
+
+    # Save to database
+    post_id = database.add_post(
+        caption=data["caption"],
+        scheduled_time=scheduled_time,
+        media_file_id=data.get("media_file_id"),
+        media_type=data.get("media_type", "none"),
+    )
+
+    # Schedule the job
+    sched_module.schedule_post(post_id, scheduled_time)
+
+    # Clean up
+    del user_data_store[user_id]
+
+    formatted_time = scheduled_time.strftime("%b %d, %Y at %I:%M %p")
+    media_type = data.get("media_type", "none")
+    media_label = {"photo": "📸 Photo", "video": "📹 Video", "none": "📝 Text-only"}.get(media_type, "📝 Text-only")
+
+    await query.edit_message_text(
+        f"✅ <b>Post #{post_id} scheduled!</b>\n\n"
+        f"📅 {formatted_time}\n"
+        f"📎 {media_label}\n"
+        f"📢 Channel: <code>{config.CHANNEL_ID}</code>\n\n"
+        "Send /newpost to schedule another post.\n"
+        "Send /list to see all pending posts.",
+        parse_mode="HTML",
+    )
+    return ConversationHandler.END
+
+
+@admin_only
+async def receive_time_text(update: Update, context):
+    """Handle text input for time (natural language or YYYY-MM-DD HH:MM)."""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+
+    scheduled_time = parse_natural_time(text)
+    if not scheduled_time:
+        await update.message.reply_text(
+            "❌ Couldn't understand that time.\n\n"
+            "<b>Try:</b>\n"
+            "• <code>today 3pm</code>\n"
+            "• <code>tomorrow 10:30am</code>\n"
+            "• <code>in 2h</code> or <code>in 30m</code>\n"
+            "• <code>2026-09-15 14:30</code>\n\n"
+            "Or use the <b>buttons</b> above ☝️",
+            parse_mode="HTML",
+            reply_markup=build_date_keyboard(),
+        )
+        return WAITING_TIME
+
+    tz = get_tz()
+    if scheduled_time.tzinfo is None:
+        scheduled_time = tz.localize(scheduled_time)
+
+    now = datetime.now(tz)
+    if scheduled_time <= now:
+        await update.message.reply_text(
+            "❌ That time is in the past! Please send a <b>future</b> time.",
+            parse_mode="HTML",
+            reply_markup=build_date_keyboard(),
         )
         return WAITING_TIME
 
@@ -209,13 +464,9 @@ async def receive_time(update: Update, context):
         media_type=data.get("media_type", "none"),
     )
 
-    # Schedule the job
     sched_module.schedule_post(post_id, scheduled_time)
-
-    # Clean up temp data
     del user_data_store[user_id]
 
-    # Format time nicely
     formatted_time = scheduled_time.strftime("%b %d, %Y at %I:%M %p")
     media_type = data.get("media_type", "none")
     media_label = {"photo": "📸 Photo", "video": "📹 Video", "none": "📝 Text-only"}.get(media_type, "📝 Text-only")
@@ -249,16 +500,13 @@ async def cmd_list(update: Update, context):
         await update.message.reply_text("📭 No pending posts scheduled.")
         return
 
-    tz = pytz.timezone(config.TIMEZONE)
+    tz = get_tz()
     lines = ["📋 <b>Pending Scheduled Posts:</b>\n"]
     for post in posts:
         scheduled_time = datetime.fromisoformat(post["scheduled_time"])
         if scheduled_time.tzinfo is None:
             scheduled_time = tz.localize(scheduled_time)
         formatted = scheduled_time.strftime("%b %d, %Y at %I:%M %p")
-        # Truncate caption for display
-        # Strip HTML tags for preview
-        import re
         raw_caption = re.sub(r'<[^>]+>', '', post["caption"])
         caption_preview = raw_caption[:50]
         if len(raw_caption) > 50:
@@ -304,10 +552,8 @@ async def post_init(application):
 
 # ── Main ─────────────────────────────────────────────────────────────────
 def main():
-    # Initialize database
     database.init_db()
 
-    # Build the bot application
     app = Application.builder().token(config.BOT_TOKEN).post_init(post_init).build()
 
     # Conversation handler for /newpost
@@ -325,21 +571,22 @@ def main():
                 CommandHandler("done", cmd_done),
             ],
             WAITING_TIME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_time),
+                CallbackQueryHandler(handle_date_pick, pattern=r"^date_"),
+                CallbackQueryHandler(handle_hour_pick, pattern=r"^hour_"),
+                CallbackQueryHandler(handle_minute_pick, pattern=r"^min_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_time_text),
                 CommandHandler("done", cmd_done),
             ],
         },
         fallbacks=[CommandHandler("done", cmd_done)],
     )
 
-    # Register handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
-    # Start the bot
     logger.info("🤖 Bot is starting...")
     logger.info("Channel: %s", config.CHANNEL_ID)
     logger.info("Admin user ID: %s", config.ADMIN_USER_ID)
