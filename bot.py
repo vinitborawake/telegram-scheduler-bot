@@ -64,6 +64,11 @@ def build_date_keyboard():
     now = datetime.now(tz)
     buttons = []
 
+    # Row 0: ⚡ Post Now (Immediate)
+    buttons.append([
+        InlineKeyboardButton("⚡ Post Now (Immediate)", callback_data="date_now"),
+    ])
+
     # Row 1: Today & Tomorrow
     today_label = f"📅 Today ({now.strftime('%b %d')})"
     tomorrow = now + timedelta(days=1)
@@ -257,9 +262,10 @@ def build_ratelimit_keyboard():
 # ── Natural language time parser ─────────────────────────────────────────
 def parse_natural_time(text: str) -> datetime | None:
     """Parse natural language time like 'today 3pm', 'tomorrow 10:30am', 'in 2h'."""
-    text = text.strip().lower()
     tz = get_tz()
     now = datetime.now(tz)
+    if text in ("now", "immediately", "right now", "post now", "send now"):
+        return now + timedelta(seconds=2)
 
     # "in Xh" or "in Xm" or "in X hours" or "in X min"
     match = re.match(r"in\s+(\d+)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)", text)
@@ -546,6 +552,43 @@ async def handle_date_pick(update: Update, context):
         return
 
     date_str = query.data.replace("date_", "")
+
+    if date_str == "now":
+        tz = get_tz()
+        now = datetime.now(tz)
+        scheduled_time = now + timedelta(seconds=2)
+        rate_limit = database.get_rate_limit()
+        final_time, was_adjusted, conflict = ensure_rate_limit_slot(scheduled_time, rate_limit)
+        data = user_data_store[user_id]
+        media_type = data.get("media_type", "none")
+        media_label = {"photo": "📸 Photo", "video": "📹 Video", "none": "📝 Text-only"}.get(media_type, "📝 Text-only")
+        post_id = database.add_post(
+            caption=data.get("caption", ""),
+            scheduled_time=final_time,
+            media_file_id=data.get("media_file_id"),
+            media_type=media_type,
+            caption_entities=data.get("caption_entities"),
+            source_chat_id=data.get("source_chat_id"),
+            source_message_id=data.get("source_message_id"),
+        )
+        sched_module.schedule_post(post_id, final_time)
+        del user_data_store[user_id]
+
+        rate_note = ""
+        if was_adjusted and conflict:
+            rate_note = f"\n\n🛡️ <i>Auto-spaced by {gap_manager.format_gap(rate_limit)} rate limit (after Post #{conflict['id']}).</i>"
+
+        await query.edit_message_text(
+            f"⚡ <b>Post #{post_id} is being published now!</b>\n\n"
+            f"📎 {media_label}\n"
+            f"📢 Destination: <code>{config.CHANNEL_ID}</code>"
+            f"{rate_note}\n\n"
+            "🚀 It will appear in your channel in a moment.\n"
+            "You will get a confirmation notification with a link as soon as it's posted!",
+            parse_mode="HTML",
+        )
+        return ConversationHandler.END
+
     user_data_store[user_id]["selected_date"] = date_str
 
     # Parse date for display
@@ -661,13 +704,14 @@ async def handle_minute_pick(update: Update, context):
     ]])
 
     await query.edit_message_text(
-        f"✅ <b>Post #{post_id} scheduled!</b>\n\n"
-        f"📅 {formatted_time}\n"
+        f"⏳ <b>Post #{post_id} Scheduled!</b>\n\n"
+        f"📅 <b>Will publish on:</b> {formatted_time}\n"
         f"📎 {media_label}\n"
         f"📢 Channel: <code>{config.CHANNEL_ID}</code>"
         f"{rate_note}\n\n"
-        "Send /newpost to schedule another post.\n"
-        "Send /list to view or cancel pending posts.",
+        f"ℹ️ <i>This post is saved in queue and will automatically broadcast to your channel at {formatted_time}.</i>\n\n"
+        "• Send /list to view all scheduled posts\n"
+        "• Send /newpost to schedule another",
         parse_mode="HTML",
         reply_markup=cancel_btn,
     )
@@ -739,17 +783,30 @@ async def receive_time_text(update: Update, context):
         InlineKeyboardButton("❌ Cancel This Post", callback_data=f"delpost_{post_id}")
     ]])
 
-    await update.message.reply_text(
-        f"✅ <b>Post #{post_id} scheduled!</b>\n\n"
-        f"📅 {formatted_time}\n"
-        f"📎 {media_label}\n"
-        f"📢 Channel: <code>{config.CHANNEL_ID}</code>"
-        f"{rate_note}\n\n"
-        "Send /newpost to schedule another post.\n"
-        "Send /list to view or cancel pending posts.",
-        parse_mode="HTML",
-        reply_markup=cancel_btn,
-    )
+    is_immediate = (final_time - now).total_seconds() < 5
+    if is_immediate:
+        await update.message.reply_text(
+            f"⚡ <b>Post #{post_id} is being published now!</b>\n\n"
+            f"📎 {media_label}\n"
+            f"📢 Destination: <code>{config.CHANNEL_ID}</code>"
+            f"{rate_note}\n\n"
+            "🚀 It will appear in your channel in a moment.\n"
+            "You will get a confirmation notification with a link as soon as it's posted!",
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text(
+            f"⏳ <b>Post #{post_id} Scheduled!</b>\n\n"
+            f"📅 <b>Will publish on:</b> {formatted_time}\n"
+            f"📎 {media_label}\n"
+            f"📢 Channel: <code>{config.CHANNEL_ID}</code>"
+            f"{rate_note}\n\n"
+            f"ℹ️ <i>This post is saved in queue and will automatically broadcast to your channel at {formatted_time}.</i>\n\n"
+            "• Send /list to view all scheduled posts\n"
+            "• Send /newpost to schedule another",
+            parse_mode="HTML",
+            reply_markup=cancel_btn,
+        )
     return ConversationHandler.END
 
 

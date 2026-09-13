@@ -137,26 +137,45 @@ async def send_post_as_user(
     # 1. Primary path: Copy message to preserve custom and animated premium emojis
     if source_chat_id and source_message_id:
         src_chat = _parse_chat_id(source_chat_id)
-        try:
-            if hasattr(client, "copy_message"):
-                await client.copy_message(
-                    chat_id=target_chat,
-                    from_chat_id=src_chat,
-                    message_id=source_message_id,
-                )
-            elif hasattr(client, "copy_messages"):
-                await client.copy_messages(
-                    chat_id=target_chat,
-                    from_chat_id=src_chat,
-                    message_ids=source_message_id,
-                )
-            logger.info("✅ Published post via Pyrogram user client copy_message (premium emojis preserved)")
-            return True
-        except Exception as e:
-            logger.warning(
-                f"Pyrogram copy_message failed from chat {src_chat} msg {source_message_id}: {e}. "
-                "Attempting direct send fallback."
-            )
+        # In Pyrogram user client, if src_chat is the user's own ID, the message lives
+        # in the private dialog with the bot, whose peer ID is the bot's user ID.
+        bot_user_id = None
+        if hasattr(config, "BOT_TOKEN") and ":" in config.BOT_TOKEN:
+            try:
+                bot_user_id = int(config.BOT_TOKEN.split(":")[0])
+            except Exception:
+                pass
+
+        me_id = getattr(client.me, "id", None) if hasattr(client, "me") and client.me else None
+        candidate_chats = []
+        if bot_user_id:
+            candidate_chats.append(bot_user_id)
+        if src_chat and src_chat != bot_user_id:
+            candidate_chats.append(src_chat)
+
+        copied = False
+        for chat_candidate in candidate_chats:
+            try:
+                if hasattr(client, "copy_message"):
+                    await client.copy_message(
+                        chat_id=target_chat,
+                        from_chat_id=chat_candidate,
+                        message_id=source_message_id,
+                    )
+                elif hasattr(client, "copy_messages"):
+                    await client.copy_messages(
+                        chat_id=target_chat,
+                        from_chat_id=chat_candidate,
+                        message_ids=source_message_id,
+                    )
+                logger.info(f"✅ Published post via Pyrogram copy_message from chat {chat_candidate} (premium emojis preserved)")
+                copied = True
+                return True
+            except Exception as e:
+                logger.warning(f"Pyrogram copy_message from chat {chat_candidate} msg {source_message_id} failed: {e}")
+
+        if not copied:
+            logger.warning("Attempting direct send fallback for user client.")
 
     # 2. Fallback path: Direct send
     try:

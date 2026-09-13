@@ -121,8 +121,8 @@ async def publish_post(post_id: int):
             source_chat_id = post.get("source_chat_id")
             source_message_id = post.get("source_message_id")
             media_type = post.get("media_type", "photo")
-            caption = post["caption"]
-            media_file_id = post.get("media_file_id")
+            caption = post.get("caption") or ""
+            media_file_id = post.get("media_file_id") or post.get("image_file_id")
             published_ok = False
 
             # 1. Try Pyrogram user client first if logged in (preserves 100% of Telegram Premium custom & animated emojis!)
@@ -156,7 +156,6 @@ async def publish_post(post_id: int):
 
             # 3. Fallback to direct API sending if copy was not applicable or failed
             if not published_ok:
-
                 # Deserialize entities from JSON if available
                 entities = None
                 entities_json = post.get("caption_entities")
@@ -182,6 +181,7 @@ async def publish_post(post_id: int):
                             caption=caption,
                             parse_mode="HTML",
                         )
+                    published_ok = True
                 elif media_type == "video" and media_file_id:
                     if entities:
                         await bot.send_video(
@@ -197,7 +197,8 @@ async def publish_post(post_id: int):
                             caption=caption,
                             parse_mode="HTML",
                         )
-                else:
+                    published_ok = True
+                elif caption:
                     # Text-only post
                     if entities:
                         await bot.send_message(
@@ -211,6 +212,12 @@ async def publish_post(post_id: int):
                             text=caption,
                             parse_mode="HTML",
                         )
+                    published_ok = True
+                else:
+                    raise ValueError(f"Post #{post_id} has no media file and empty caption.")
+
+            if not published_ok:
+                raise RuntimeError(f"Failed to publish post #{post_id} through all delivery methods.")
 
             database.mark_posted(post_id)
             last_published_time = datetime.now(tz)
@@ -218,9 +225,16 @@ async def publish_post(post_id: int):
 
             # Notify admin
             try:
+                channel_str = str(config.CHANNEL_ID)
+                link_html = ""
+                if channel_str.startswith("@"):
+                    username = channel_str.replace("@", "")
+                    link_html = f"\n\n📢 <a href=\"https://t.me/{username}\">View Channel ({config.CHANNEL_ID})</a>"
                 await bot.send_message(
                     chat_id=config.ADMIN_USER_ID,
-                    text=f"✅ Post #{post_id} has been published to the channel!",
+                    text=f"✅ <b>Post #{post_id} has been published to the channel!</b>{link_html}",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
                 )
             except Exception:
                 pass  # Don't fail if admin notification fails
