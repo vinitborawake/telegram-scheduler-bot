@@ -84,13 +84,17 @@ def set_setting(key: str, value: str):
     conn.close()
 
 
+DEFAULT_RATE_LIMIT = 300  # 5 minutes default gap
+
+
 def get_rate_limit() -> int:
-    """Get the rate limit in seconds (default: 90 seconds = 1m 30s)."""
-    val = get_setting("rate_limit_seconds", "90")
+    """Get the rate limit in seconds (default: 300 seconds = 5 minutes)."""
+    val = get_setting("rate_limit_seconds", str(DEFAULT_RATE_LIMIT))
     try:
         return max(10, int(val))
     except ValueError:
-        return 90
+        return DEFAULT_RATE_LIMIT
+
 
 
 def set_rate_limit(seconds: int):

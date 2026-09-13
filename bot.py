@@ -17,7 +17,9 @@ from telegram.ext import (
 
 import config
 import database
+import gap_manager
 import scheduler as sched_module
+import user_client
 
 # ── Logging ──────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -302,16 +304,20 @@ def parse_natural_time(text: str) -> datetime | None:
 @admin_only
 async def cmd_start(update: Update, context):
     rate_limit = database.get_rate_limit()
+    status_icon = "⭐ Premium User Logged In" if user_client.has_user_session() else "🤖 Standard Bot Mode"
     await update.message.reply_text(
         "👋 <b>Welcome to the Channel Scheduler Bot!</b>\n\n"
-        "I can schedule posts to your Telegram channel safely.\n\n"
+        f"Mode: <b>{status_icon}</b>\n\n"
         "<b>Commands:</b>\n"
-        "/newpost — Schedule a new post\n"
-        "/list — View all pending posts\n"
-        "/cancel <code>&lt;id&gt;</code> — Cancel a scheduled post\n"
-        f"/ratelimit — Set minimum delay between posts (current: {format_duration(rate_limit)})\n"
-        "/help — Show this message\n\n"
-        "✨ <b>Supports:</b> Bold, italic, links, premium emoji, photos, videos & text-only posts!",
+        "📝 /newpost — Schedule a new post\n"
+        "📋 /list — View all pending posts\n"
+        "❌ /cancel <code>&lt;id&gt;</code> — Cancel a scheduled post\n"
+        f"⏱️ /gap — Set post interval (1 to 60 mins) (current: {gap_manager.format_gap(rate_limit)})\n"
+        "📱 /login — Connect your Telegram Premium account (unlocks all premium custom emojis!)\n"
+        "ℹ️ /userstatus — View connected user account & Premium status\n"
+        "🚪 /logout — Disconnect your Telegram user account\n"
+        "❓ /help — Show full guide\n\n"
+        "✨ <b>Supports:</b> Native Telegram Premium emojis, bold, italic, links, photos, videos & text posts!",
         parse_mode="HTML",
     )
 
@@ -321,21 +327,28 @@ async def cmd_start(update: Update, context):
 async def cmd_help(update: Update, context):
     tz = config.TIMEZONE
     rate_limit = database.get_rate_limit()
+    status_icon = "⭐ Premium User Account" if user_client.has_user_session() else "🤖 Standard Bot"
     await update.message.reply_text(
         "📖 <b>How to schedule a post:</b>\n\n"
         "1️⃣ Send /newpost\n"
         "2️⃣ Send a 📸 photo, 📹 video, or /skip for text-only\n"
         "3️⃣ Type the caption/text for the post\n"
         "   ✨ <i>Premium emoji, bold, italic, links — all preserved!</i>\n"
-        "4️⃣ Pick date &amp; time using <b>buttons</b> or type:\n"
+        "4️⃣ Pick date &amp; time using <b>interactive buttons</b> or type:\n"
         "   • <code>today 3pm</code>\n"
         "   • <code>tomorrow 10:30am</code>\n"
         "   • <code>in 2h</code> or <code>in 30m</code>\n"
         f"   • <code>2026-09-15 14:30</code>\n\n"
         f"⏰ Timezone: {tz}\n"
-        f"🛡️ Rate limit: {format_duration(rate_limit)} (change with /ratelimit)\n\n"
-        "📋 /list — See all scheduled posts\n"
-        "⏱️ /ratelimit — Adjust delay between posts (e.g. <code>/ratelimit 1m 30s</code>)\n"
+        f"🛡️ Post Gap: {gap_manager.format_gap(rate_limit)} (change with /gap)\n"
+        f"👤 Mode: {status_icon}\n\n"
+        "<b>All Bot Commands:</b>\n"
+        "📝 /newpost — Schedule a post\n"
+        "📋 /list — View pending posts with 1-tap cancel\n"
+        "⏱️ /gap — Choose gap from 1 to 60 minutes (presets or 4-page grid)\n"
+        "📱 /login — Sign in with your Telegram Premium account for real animated emojis\n"
+        "ℹ️ /userstatus — Check your logged-in account status\n"
+        "🚪 /logout — Log out your user session\n"
         "❌ /cancel <code>&lt;id&gt;</code> — Cancel a post by ID\n"
         "🚫 /done — Cancel current operation",
         parse_mode="HTML",
@@ -860,53 +873,11 @@ async def handle_cancel_callback(update: Update, context):
             await query.answer("❌ Post already cancelled or posted!", show_alert=True)
 
 
-# ── /ratelimit command ───────────────────────────────────────────────────
+# ── /ratelimit & /gap commands ───────────────────────────────────────────
 @admin_only
 async def cmd_ratelimit(update: Update, context):
-    """View or change the minimum delay between posts."""
-    if context.args:
-        arg_text = " ".join(context.args)
-        seconds = parse_duration(arg_text)
-        if seconds is None:
-            await update.message.reply_text(
-                "❌ <b>Could not parse time format.</b>\n\n"
-                "<b>Valid examples:</b>\n"
-                "• <code>/ratelimit 1m 30s</code>\n"
-                "• <code>/ratelimit 30s</code>\n"
-                "• <code>/ratelimit 2m</code>\n"
-                "• <code>/ratelimit 90</code> (seconds)",
-                parse_mode="HTML",
-            )
-            return
-
-        if seconds < 10:
-            await update.message.reply_text(
-                "⚠️ Minimum rate limit is <b>10 seconds</b> to keep your Telegram account safe from spam detection.",
-                parse_mode="HTML",
-            )
-            return
-
-        database.set_rate_limit(seconds)
-        formatted = format_duration(seconds)
-        await update.message.reply_text(
-            f"✅ <b>Rate limit updated!</b>\n\n"
-            f"Minimum delay between channel posts is now: <b>{formatted}</b> ({seconds}s).\n\n"
-            f"Posts to <code>{config.CHANNEL_ID}</code> will always be spaced at least {formatted} apart.",
-            parse_mode="HTML",
-        )
-        return
-
-    current = database.get_rate_limit()
-    formatted = format_duration(current)
-    await update.message.reply_text(
-        f"⏱️ <b>Post Rate Limit / Interval Settings</b>\n\n"
-        f"Current minimum delay: <b>{formatted}</b> ({current}s)\n\n"
-        f"This protects your Telegram account by ensuring posts to <code>{config.CHANNEL_ID}</code> are never sent too rapidly.\n\n"
-        "👇 <b>Select a preset below or type a custom time:</b>\n"
-        "<i>e.g. <code>/ratelimit 1m 30s</code> or <code>/ratelimit 45s</code></i>",
-        parse_mode="HTML",
-        reply_markup=build_ratelimit_keyboard(),
-    )
+    """View or change the minimum delay between posts (delegates to gap_manager)."""
+    return await gap_manager.cmd_gap(update, context)
 
 
 async def handle_ratelimit_pick(update: Update, context):
@@ -969,11 +940,16 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(user_client.get_login_conversation_handler())
+    app.add_handler(CommandHandler("logout", user_client.cmd_logout))
+    app.add_handler(CommandHandler("userstatus", user_client.cmd_user_status))
+    app.add_handler(CommandHandler("status", user_client.cmd_user_status))
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("ratelimit", cmd_ratelimit))
     app.add_handler(CommandHandler("delay", cmd_ratelimit))
+    gap_manager.register_gap_handlers(app)
     app.add_handler(CallbackQueryHandler(handle_ratelimit_pick, pattern=r"^rl_"))
     app.add_handler(CallbackQueryHandler(handle_cancel_callback, pattern=r"^delpost_"))
 

@@ -11,6 +11,7 @@ from telegram import Bot, MessageEntity
 
 import config
 import database
+import user_client
 
 logger = logging.getLogger(__name__)
 
@@ -117,28 +118,44 @@ async def publish_post(post_id: int):
                 await asyncio.sleep(wait_time)
 
         try:
-            # 1. Try copy_message first (preserves 100% of Telegram Premium custom emojis!)
             source_chat_id = post.get("source_chat_id")
             source_message_id = post.get("source_message_id")
-            copied_ok = False
+            media_type = post.get("media_type", "photo")
+            caption = post["caption"]
+            media_file_id = post.get("media_file_id")
+            published_ok = False
 
-            if source_chat_id and source_message_id:
+            # 1. Try Pyrogram user client first if logged in (preserves 100% of Telegram Premium custom & animated emojis!)
+            if user_client.has_user_session():
+                try:
+                    published_ok = await user_client.send_post_as_user(
+                        channel_id=config.CHANNEL_ID,
+                        caption=caption,
+                        media_type=media_type,
+                        media_file_id=media_file_id,
+                        source_chat_id=source_chat_id,
+                        source_message_id=source_message_id,
+                    )
+                    if published_ok:
+                        logger.info("✅ Published post #%d via Pyrogram user client (Premium emojis preserved!)", post_id)
+                except Exception as userbot_err:
+                    logger.warning("User client post failed for #%d: %s. Falling back to Bot API.", post_id, userbot_err)
+
+            # 2. Fallback to Bot API copy_message
+            if not published_ok and source_chat_id and source_message_id:
                 try:
                     await bot.copy_message(
                         chat_id=config.CHANNEL_ID,
                         from_chat_id=source_chat_id,
                         message_id=source_message_id,
                     )
-                    copied_ok = True
-                    logger.info("✅ Published post #%d via copy_message (premium emojis preserved)", post_id)
+                    published_ok = True
+                    logger.info("✅ Published post #%d via Bot API copy_message", post_id)
                 except Exception as copy_err:
                     logger.warning("copy_message failed for post #%d: %s. Falling back to direct API send.", post_id, copy_err)
 
-            # 2. Fallback to direct API sending if copy_message was not applicable or failed
-            if not copied_ok:
-                media_type = post.get("media_type", "photo")
-                caption = post["caption"]
-                media_file_id = post.get("media_file_id")
+            # 3. Fallback to direct API sending if copy was not applicable or failed
+            if not published_ok:
 
                 # Deserialize entities from JSON if available
                 entities = None
