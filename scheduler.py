@@ -80,6 +80,17 @@ def remove_scheduled_post(post_id: int):
         logger.info("Removed scheduled job for post #%d", post_id)
 
 
+def remove_all_scheduled_posts():
+    """Remove all scheduled post jobs."""
+    jobs = scheduler.get_jobs()
+    removed = 0
+    for job in jobs:
+        if job.id.startswith("post_"):
+            scheduler.remove_job(job.id)
+            removed += 1
+    logger.info("Removed all scheduled post jobs (%d removed)", removed)
+
+
 async def publish_post(post_id: int):
     """Publish a post to the Telegram channel with rate-limiting protection."""
     global last_published_time
@@ -106,64 +117,83 @@ async def publish_post(post_id: int):
                 await asyncio.sleep(wait_time)
 
         try:
-            media_type = post.get("media_type", "photo")
-            caption = post["caption"]
-            media_file_id = post.get("media_file_id")
+            # 1. Try copy_message first (preserves 100% of Telegram Premium custom emojis!)
+            source_chat_id = post.get("source_chat_id")
+            source_message_id = post.get("source_message_id")
+            copied_ok = False
 
-            # Deserialize entities from JSON if available
-            entities = None
-            entities_json = post.get("caption_entities")
-            if entities_json:
+            if source_chat_id and source_message_id:
                 try:
-                    entities_list = json.loads(entities_json)
-                    entities = [MessageEntity.de_json(e, bot) for e in entities_list]
-                except (json.JSONDecodeError, Exception) as e:
-                    logger.warning("Failed to deserialize entities for post #%d: %s", post_id, e)
+                    await bot.copy_message(
+                        chat_id=config.CHANNEL_ID,
+                        from_chat_id=source_chat_id,
+                        message_id=source_message_id,
+                    )
+                    copied_ok = True
+                    logger.info("✅ Published post #%d via copy_message (premium emojis preserved)", post_id)
+                except Exception as copy_err:
+                    logger.warning("copy_message failed for post #%d: %s. Falling back to direct API send.", post_id, copy_err)
 
-            if media_type == "photo" and media_file_id:
-                if entities:
-                    await bot.send_photo(
-                        chat_id=config.CHANNEL_ID,
-                        photo=media_file_id,
-                        caption=caption,
-                        caption_entities=entities,
-                    )
+            # 2. Fallback to direct API sending if copy_message was not applicable or failed
+            if not copied_ok:
+                media_type = post.get("media_type", "photo")
+                caption = post["caption"]
+                media_file_id = post.get("media_file_id")
+
+                # Deserialize entities from JSON if available
+                entities = None
+                entities_json = post.get("caption_entities")
+                if entities_json:
+                    try:
+                        entities_list = json.loads(entities_json)
+                        entities = [MessageEntity.de_json(e, bot) for e in entities_list]
+                    except (json.JSONDecodeError, Exception) as e:
+                        logger.warning("Failed to deserialize entities for post #%d: %s", post_id, e)
+
+                if media_type == "photo" and media_file_id:
+                    if entities:
+                        await bot.send_photo(
+                            chat_id=config.CHANNEL_ID,
+                            photo=media_file_id,
+                            caption=caption,
+                            caption_entities=entities,
+                        )
+                    else:
+                        await bot.send_photo(
+                            chat_id=config.CHANNEL_ID,
+                            photo=media_file_id,
+                            caption=caption,
+                            parse_mode="HTML",
+                        )
+                elif media_type == "video" and media_file_id:
+                    if entities:
+                        await bot.send_video(
+                            chat_id=config.CHANNEL_ID,
+                            video=media_file_id,
+                            caption=caption,
+                            caption_entities=entities,
+                        )
+                    else:
+                        await bot.send_video(
+                            chat_id=config.CHANNEL_ID,
+                            video=media_file_id,
+                            caption=caption,
+                            parse_mode="HTML",
+                        )
                 else:
-                    await bot.send_photo(
-                        chat_id=config.CHANNEL_ID,
-                        photo=media_file_id,
-                        caption=caption,
-                        parse_mode="HTML",
-                    )
-            elif media_type == "video" and media_file_id:
-                if entities:
-                    await bot.send_video(
-                        chat_id=config.CHANNEL_ID,
-                        video=media_file_id,
-                        caption=caption,
-                        caption_entities=entities,
-                    )
-                else:
-                    await bot.send_video(
-                        chat_id=config.CHANNEL_ID,
-                        video=media_file_id,
-                        caption=caption,
-                        parse_mode="HTML",
-                    )
-            else:
-                # Text-only post
-                if entities:
-                    await bot.send_message(
-                        chat_id=config.CHANNEL_ID,
-                        text=caption,
-                        entities=entities,
-                    )
-                else:
-                    await bot.send_message(
-                        chat_id=config.CHANNEL_ID,
-                        text=caption,
-                        parse_mode="HTML",
-                    )
+                    # Text-only post
+                    if entities:
+                        await bot.send_message(
+                            chat_id=config.CHANNEL_ID,
+                            text=caption,
+                            entities=entities,
+                        )
+                    else:
+                        await bot.send_message(
+                            chat_id=config.CHANNEL_ID,
+                            text=caption,
+                            parse_mode="HTML",
+                        )
 
             database.mark_posted(post_id)
             last_published_time = datetime.now(tz)

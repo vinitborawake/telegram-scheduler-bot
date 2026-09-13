@@ -124,6 +124,33 @@ def build_minute_keyboard():
     return InlineKeyboardMarkup(buttons)
 
 
+def build_cancel_keyboard(posts: list[dict]) -> InlineKeyboardMarkup:
+    """Build inline buttons for canceling pending posts."""
+    buttons = []
+    tz = get_tz()
+    for post in posts:
+        dt = datetime.fromisoformat(post["scheduled_time"])
+        if dt.tzinfo is None:
+            dt = tz.localize(dt)
+        time_str = dt.strftime("%b %d %I:%M %p")
+        media_type = post.get("media_type", "none")
+        media_icon = {"photo": "📸", "video": "📹", "none": "📝"}.get(media_type, "📝")
+        raw_caption = re.sub(r'<[^>]+>', '', post.get("caption") or "")[:22].strip()
+        preview = f" (\"{raw_caption}...\")" if raw_caption else ""
+        buttons.append([
+            InlineKeyboardButton(
+                f"❌ Cancel #{post['id']}: {media_icon} {time_str}{preview}",
+                callback_data=f"delpost_{post['id']}"
+            )
+        ])
+    if len(posts) > 1:
+        buttons.append([
+            InlineKeyboardButton("🗑️ Cancel All Pending Posts", callback_data="delpost_all")
+        ])
+    return InlineKeyboardMarkup(buttons)
+
+
+
 # ── Duration & Rate Limit helpers ────────────────────────────────────────
 def format_duration(seconds: int) -> str:
     """Format seconds into a human-friendly string (e.g. 90 -> '1 min 30 sec')."""
@@ -321,8 +348,12 @@ async def cmd_newpost(update: Update, context):
     user_id = update.effective_user.id
     user_data_store[user_id] = {}
     await update.message.reply_text(
-        "📸 <b>Send me a photo or video</b> for your post.\n\n"
-        "Or send /skip for a <b>text-only</b> post.\n\n"
+        "📝 <b>What would you like to schedule?</b>\n\n"
+        "✨ <b>Best for Telegram Premium Emoji:</b>\n"
+        "• Send a 📸 <b>photo or 📹 video WITH your text/caption attached</b>\n"
+        "• Or send a 📝 <b>formatted text message</b> directly\n"
+        "• Or forward any post from another channel/chat\n\n"
+        "<i>(All real premium animated emojis will be preserved!)</i>\n"
         "<i>(Send /done to cancel)</i>",
         parse_mode="HTML",
     )
@@ -335,12 +366,35 @@ async def receive_photo(update: Update, context):
     photo = update.message.photo[-1]
     user_data_store[user_id]["media_file_id"] = photo.file_id
     user_data_store[user_id]["media_type"] = "photo"
+    user_data_store[user_id]["source_chat_id"] = update.effective_chat.id
+    user_data_store[user_id]["source_message_id"] = update.message.message_id
+
+    # If photo already has a caption in the same message!
+    if update.message.caption:
+        caption = update.message.caption
+        entities = update.message.caption_entities
+        user_data_store[user_id]["caption"] = caption
+        user_data_store[user_id]["caption_entities"] = (
+            json.dumps([e.to_dict() for e in entities]) if entities else None
+        )
+        preview = update.message.caption_html if update.message.caption_html else caption
+        await update.message.reply_text(
+            "✅ <b>Photo & Caption received!</b>\n\n"
+            f"👁️ <b>Preview:</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"{preview}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            "✨ <i>All premium emojis & formatting will be copied directly to your channel!</i>\n\n"
+            "🕐 <b>Pick the date to publish:</b>",
+            parse_mode="HTML",
+            reply_markup=build_date_keyboard(),
+        )
+        return WAITING_TIME
 
     await update.message.reply_text(
         "✅ Photo received!\n\n"
         "✏️ Now <b>send me the caption/text</b> for this post.\n\n"
-        "✨ <i>You can use formatted text, premium emoji, bold, italic, links — everything will be preserved!</i>\n\n"
-        "<i>(Send /done to cancel)</i>",
+        "<i>(Or send /skip for no caption, /done to cancel)</i>",
         parse_mode="HTML",
     )
     return WAITING_TEXT
@@ -351,15 +405,70 @@ async def receive_video(update: Update, context):
     user_id = update.effective_user.id
     user_data_store[user_id]["media_file_id"] = update.message.video.file_id
     user_data_store[user_id]["media_type"] = "video"
+    user_data_store[user_id]["source_chat_id"] = update.effective_chat.id
+    user_data_store[user_id]["source_message_id"] = update.message.message_id
+
+    # If video already has a caption in the same message!
+    if update.message.caption:
+        caption = update.message.caption
+        entities = update.message.caption_entities
+        user_data_store[user_id]["caption"] = caption
+        user_data_store[user_id]["caption_entities"] = (
+            json.dumps([e.to_dict() for e in entities]) if entities else None
+        )
+        preview = update.message.caption_html if update.message.caption_html else caption
+        await update.message.reply_text(
+            "✅ <b>Video & Caption received!</b>\n\n"
+            f"👁️ <b>Preview:</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"{preview}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            "✨ <i>All premium emojis & formatting will be copied directly to your channel!</i>\n\n"
+            "🕐 <b>Pick the date to publish:</b>",
+            parse_mode="HTML",
+            reply_markup=build_date_keyboard(),
+        )
+        return WAITING_TIME
 
     await update.message.reply_text(
         "✅ Video received!\n\n"
         "✏️ Now <b>send me the caption/text</b> for this post.\n\n"
-        "✨ <i>You can use formatted text, premium emoji, bold, italic, links — everything will be preserved!</i>\n\n"
-        "<i>(Send /done to cancel)</i>",
+        "<i>(Or send /skip for no caption, /done to cancel)</i>",
         parse_mode="HTML",
     )
     return WAITING_TEXT
+
+
+@admin_only
+async def receive_text_in_media(update: Update, context):
+    """Handle direct text post sent in the initial media state."""
+    user_id = update.effective_user.id
+    user_data_store[user_id]["media_file_id"] = None
+    user_data_store[user_id]["media_type"] = "none"
+    user_data_store[user_id]["source_chat_id"] = update.effective_chat.id
+    user_data_store[user_id]["source_message_id"] = update.message.message_id
+
+    caption = update.message.text
+    entities = update.message.entities
+    user_data_store[user_id]["caption"] = caption
+    user_data_store[user_id]["caption_entities"] = (
+        json.dumps([e.to_dict() for e in entities]) if entities else None
+    )
+
+    preview = update.message.text_html if update.message.text_html else caption
+
+    await update.message.reply_text(
+        "📝 <b>Text Post received!</b>\n\n"
+        f"👁️ <b>Preview:</b>\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"{preview}\n"
+        f"━━━━━━━━━━━━━━━\n"
+        "✨ <i>Premium emoji preserved via direct copy!</i>\n\n"
+        "🕐 <b>Pick the date to publish:</b>",
+        parse_mode="HTML",
+        reply_markup=build_date_keyboard(),
+    )
+    return WAITING_TIME
 
 
 @admin_only
@@ -382,20 +491,19 @@ async def skip_media(update: Update, context):
 async def receive_text(update: Update, context):
     user_id = update.effective_user.id
 
-    # Store RAW text + entities (not HTML) to perfectly preserve premium emoji
     caption = update.message.text
     entities = update.message.entities
 
     user_data_store[user_id]["caption"] = caption
+    user_data_store[user_id]["caption_entities"] = (
+        json.dumps([e.to_dict() for e in entities]) if entities else None
+    )
 
-    # Serialize entities to JSON for database storage
-    if entities:
-        entities_json = json.dumps([e.to_dict() for e in entities])
-        user_data_store[user_id]["caption_entities"] = entities_json
-    else:
-        user_data_store[user_id]["caption_entities"] = None
+    # For text-only posts, save source message ID
+    if user_data_store[user_id].get("media_type") == "none":
+        user_data_store[user_id]["source_chat_id"] = update.effective_chat.id
+        user_data_store[user_id]["source_message_id"] = update.message.message_id
 
-    # Use text_html for preview display only
     preview = update.message.text_html if update.message.text_html else caption
 
     media_type = user_data_store[user_id].get("media_type", "none")
@@ -512,11 +620,13 @@ async def handle_minute_pick(update: Update, context):
 
     # Save to database
     post_id = database.add_post(
-        caption=data["caption"],
+        caption=data.get("caption", ""),
         scheduled_time=final_time,
         media_file_id=data.get("media_file_id"),
         media_type=data.get("media_type", "none"),
         caption_entities=data.get("caption_entities"),
+        source_chat_id=data.get("source_chat_id"),
+        source_message_id=data.get("source_message_id"),
     )
 
     # Schedule the job
@@ -533,6 +643,10 @@ async def handle_minute_pick(update: Update, context):
     if was_adjusted and conflict:
         rate_note = f"\n\n🛡️ <i>Auto-spaced by {format_duration(rate_limit)} rate limit (spaced out to avoid overlapping Post #{conflict['id']}).</i>"
 
+    cancel_btn = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel This Post", callback_data=f"delpost_{post_id}")
+    ]])
+
     await query.edit_message_text(
         f"✅ <b>Post #{post_id} scheduled!</b>\n\n"
         f"📅 {formatted_time}\n"
@@ -540,8 +654,9 @@ async def handle_minute_pick(update: Update, context):
         f"📢 Channel: <code>{config.CHANNEL_ID}</code>"
         f"{rate_note}\n\n"
         "Send /newpost to schedule another post.\n"
-        "Send /list to see all pending posts.",
+        "Send /list to view or cancel pending posts.",
         parse_mode="HTML",
+        reply_markup=cancel_btn,
     )
     return ConversationHandler.END
 
@@ -587,11 +702,13 @@ async def receive_time_text(update: Update, context):
     # Save to database
     data = user_data_store[user_id]
     post_id = database.add_post(
-        caption=data["caption"],
+        caption=data.get("caption", ""),
         scheduled_time=final_time,
         media_file_id=data.get("media_file_id"),
         media_type=data.get("media_type", "none"),
         caption_entities=data.get("caption_entities"),
+        source_chat_id=data.get("source_chat_id"),
+        source_message_id=data.get("source_message_id"),
     )
 
     sched_module.schedule_post(post_id, final_time)
@@ -605,6 +722,10 @@ async def receive_time_text(update: Update, context):
     if was_adjusted and conflict:
         rate_note = f"\n\n🛡️ <i>Auto-spaced by {format_duration(rate_limit)} rate limit (spaced out to avoid overlapping Post #{conflict['id']}).</i>"
 
+    cancel_btn = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel This Post", callback_data=f"delpost_{post_id}")
+    ]])
+
     await update.message.reply_text(
         f"✅ <b>Post #{post_id} scheduled!</b>\n\n"
         f"📅 {formatted_time}\n"
@@ -612,8 +733,9 @@ async def receive_time_text(update: Update, context):
         f"📢 Channel: <code>{config.CHANNEL_ID}</code>"
         f"{rate_note}\n\n"
         "Send /newpost to schedule another post.\n"
-        "Send /list to see all pending posts.",
+        "Send /list to view or cancel pending posts.",
         parse_mode="HTML",
+        reply_markup=cancel_btn,
     )
     return ConversationHandler.END
 
@@ -642,7 +764,7 @@ async def cmd_list(update: Update, context):
         if scheduled_time.tzinfo is None:
             scheduled_time = tz.localize(scheduled_time)
         formatted = scheduled_time.strftime("%b %d, %Y at %I:%M %p")
-        raw_caption = re.sub(r'<[^>]+>', '', post["caption"])
+        raw_caption = re.sub(r'<[^>]+>', '', post.get("caption") or "")
         caption_preview = raw_caption[:50]
         if len(raw_caption) > 50:
             caption_preview += "..."
@@ -650,33 +772,92 @@ async def cmd_list(update: Update, context):
         media_icon = {"photo": "📸", "video": "📹", "none": "📝"}.get(media_type, "📝")
         lines.append(f"<b>#{post['id']}</b> {media_icon} — {formatted}\n   <i>{caption_preview}</i>\n")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    lines.append("👇 <b>Tap any button below to cancel a post:</b>")
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=build_cancel_keyboard(posts),
+    )
 
 
 # ── /cancel command ──────────────────────────────────────────────────────
 @admin_only
 async def cmd_cancel(update: Update, context):
-    if not context.args:
-        await update.message.reply_text(
-            "Usage: <code>/cancel &lt;id&gt;</code>\nExample: <code>/cancel 3</code>",
+    if context.args:
+        try:
+            post_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid ID. Use a number.")
+            return
+
+        success = database.cancel_post(post_id)
+        if success:
+            sched_module.remove_scheduled_post(post_id)
+            await update.message.reply_text(f"✅ Post #{post_id} has been cancelled.")
+        else:
+            await update.message.reply_text(
+                f"❌ Post #{post_id} not found or already posted/cancelled."
+            )
+        return
+
+    # If no ID given, show interactive buttons for all pending posts
+    posts = database.get_pending_posts()
+    if not posts:
+        await update.message.reply_text("📭 <b>No pending posts to cancel.</b>", parse_mode="HTML")
+        return
+
+    await update.message.reply_text(
+        "🗑️ <b>Select a post to cancel:</b>\n\nTap any button below to cancel that post immediately:",
+        parse_mode="HTML",
+        reply_markup=build_cancel_keyboard(posts),
+    )
+
+
+async def handle_cancel_callback(update: Update, context):
+    """Handle instant post cancellation via inline buttons."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != config.ADMIN_USER_ID:
+        return
+
+    data = query.data
+
+    if data == "delpost_all":
+        count = database.cancel_all_posts()
+        sched_module.remove_all_scheduled_posts()
+        await query.edit_message_text(
+            f"✅ <b>All {count} pending post(s) have been cancelled!</b>\n\n📭 The posting queue is now empty.",
             parse_mode="HTML",
         )
         return
 
-    try:
-        post_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Invalid ID. Use a number.")
-        return
+    if data.startswith("delpost_"):
+        try:
+            post_id = int(data.replace("delpost_", ""))
+        except ValueError:
+            return
 
-    success = database.cancel_post(post_id)
-    if success:
-        sched_module.remove_scheduled_post(post_id)
-        await update.message.reply_text(f"✅ Post #{post_id} has been cancelled.")
-    else:
-        await update.message.reply_text(
-            f"❌ Post #{post_id} not found or already posted/cancelled."
-        )
+        success = database.cancel_post(post_id)
+        if success:
+            sched_module.remove_scheduled_post(post_id)
+            remaining = database.get_pending_posts()
+            if remaining:
+                await query.edit_message_text(
+                    f"✅ <b>Post #{post_id} cancelled!</b>\n\n"
+                    "📋 <b>Remaining pending posts:</b>\n"
+                    "Tap below if you want to cancel more:",
+                    parse_mode="HTML",
+                    reply_markup=build_cancel_keyboard(remaining),
+                )
+            else:
+                await query.edit_message_text(
+                    f"✅ <b>Post #{post_id} cancelled!</b>\n\n"
+                    "📭 No more pending posts scheduled.",
+                    parse_mode="HTML",
+                )
+        else:
+            await query.answer("❌ Post already cancelled or posted!", show_alert=True)
 
 
 # ── /ratelimit command ───────────────────────────────────────────────────
@@ -767,6 +948,7 @@ def main():
             WAITING_MEDIA: [
                 MessageHandler(filters.PHOTO, receive_photo),
                 MessageHandler(filters.VIDEO, receive_video),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text_in_media),
                 CommandHandler("skip", skip_media),
                 CommandHandler("done", cmd_done),
             ],
@@ -793,6 +975,7 @@ def main():
     app.add_handler(CommandHandler("ratelimit", cmd_ratelimit))
     app.add_handler(CommandHandler("delay", cmd_ratelimit))
     app.add_handler(CallbackQueryHandler(handle_ratelimit_pick, pattern=r"^rl_"))
+    app.add_handler(CallbackQueryHandler(handle_cancel_callback, pattern=r"^delpost_"))
 
     logger.info("🤖 Bot is starting...")
     logger.info("Channel: %s", config.CHANNEL_ID)

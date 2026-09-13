@@ -24,6 +24,8 @@ def init_db():
             caption TEXT NOT NULL,
             caption_entities TEXT,
             scheduled_time TEXT NOT NULL,
+            source_chat_id INTEGER,
+            source_message_id INTEGER,
             status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
@@ -50,6 +52,16 @@ def init_db():
     if "media_file_id" not in columns:
         try:
             conn.execute("ALTER TABLE scheduled_posts ADD COLUMN media_file_id TEXT")
+        except Exception:
+            pass
+    if "source_chat_id" not in columns:
+        try:
+            conn.execute("ALTER TABLE scheduled_posts ADD COLUMN source_chat_id INTEGER")
+        except Exception:
+            pass
+    if "source_message_id" not in columns:
+        try:
+            conn.execute("ALTER TABLE scheduled_posts ADD COLUMN source_message_id INTEGER")
         except Exception:
             pass
     conn.commit()
@@ -87,16 +99,37 @@ def set_rate_limit(seconds: int):
 
 
 
-def add_post(caption: str, scheduled_time: datetime, media_file_id: str = None, media_type: str = "none", caption_entities: str = None) -> int:
+def add_post(
+    caption: str,
+    scheduled_time: datetime,
+    media_file_id: str = None,
+    media_type: str = "none",
+    caption_entities: str = None,
+    source_chat_id: int = None,
+    source_message_id: int = None,
+) -> int:
     """Add a new scheduled post. Returns the post ID.
     media_type can be: 'photo', 'video', or 'none'
     caption_entities is a JSON string of Telegram MessageEntity objects
+    source_chat_id and source_message_id allow copying the exact message (preserves premium emojis)
     """
     conn = get_connection()
-    cursor = conn.execute(
-        "INSERT INTO scheduled_posts (media_file_id, media_type, caption, caption_entities, scheduled_time) VALUES (?, ?, ?, ?, ?)",
-        (media_file_id, media_type, caption, caption_entities, scheduled_time.isoformat()),
-    )
+    cursor = conn.execute("PRAGMA table_info(scheduled_posts)")
+    columns = [row["name"] for row in cursor.fetchall()]
+    if "image_file_id" in columns:
+        cursor = conn.execute(
+            """INSERT INTO scheduled_posts 
+               (image_file_id, media_file_id, media_type, caption, caption_entities, scheduled_time, source_chat_id, source_message_id) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (media_file_id or "", media_file_id, media_type, caption, caption_entities, scheduled_time.isoformat(), source_chat_id, source_message_id),
+        )
+    else:
+        cursor = conn.execute(
+            """INSERT INTO scheduled_posts 
+               (media_file_id, media_type, caption, caption_entities, scheduled_time, source_chat_id, source_message_id) 
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (media_file_id, media_type, caption, caption_entities, scheduled_time.isoformat(), source_chat_id, source_message_id),
+        )
     post_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -144,3 +177,15 @@ def cancel_post(post_id: int) -> bool:
     conn.commit()
     conn.close()
     return updated
+
+
+def cancel_all_posts() -> int:
+    """Cancel all pending posts. Returns the count of cancelled posts."""
+    conn = get_connection()
+    cursor = conn.execute(
+        "UPDATE scheduled_posts SET status = 'cancelled' WHERE status = 'pending'"
+    )
+    count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return count
