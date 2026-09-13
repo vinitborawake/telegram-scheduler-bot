@@ -108,6 +108,7 @@ Send `/done` at any point during the `/newpost` flow to cancel.
 | `/newpost` | Schedule a new post |
 | `/list` | View all pending posts |
 | `/cancel <id>` | Cancel a scheduled post |
+| `/ratelimit` | Set or view minimum delay between posts (e.g. `1m 30s` or `30s`) |
 | `/done` | Cancel current operation |
 | `/help` | Show help message |
 

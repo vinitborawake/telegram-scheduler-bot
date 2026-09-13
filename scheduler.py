@@ -1,6 +1,8 @@
+import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Optional
 
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -15,6 +17,8 @@ logger = logging.getLogger(__name__)
 # Global scheduler instance
 scheduler: AsyncIOScheduler = None
 bot: Bot = None
+publish_lock = asyncio.Lock()
+last_published_time: Optional[datetime] = None
 
 
 def init_scheduler(telegram_bot: Bot):
@@ -30,6 +34,9 @@ def init_scheduler(telegram_bot: Bot):
     pending = database.get_pending_posts()
     now = datetime.now(tz)
     reloaded = 0
+    missed_offset = 0
+    rate_limit = database.get_rate_limit()
+
     for post in pending:
         scheduled_time = datetime.fromisoformat(post["scheduled_time"])
         if scheduled_time.tzinfo is None:
@@ -38,9 +45,11 @@ def init_scheduler(telegram_bot: Bot):
             schedule_post(post["id"], scheduled_time)
             reloaded += 1
         else:
-            # Post was missed (bot was down during scheduled time) — post it now
-            logger.warning("Post #%d was missed, publishing now", post["id"])
-            schedule_post(post["id"], now)
+            # Space out missed posts by the rate limit to avoid flooding
+            replay_time = now + timedelta(seconds=missed_offset)
+            logger.warning("Post #%d was missed, scheduled for replay at %s", post["id"], replay_time)
+            schedule_post(post["id"], replay_time)
+            missed_offset += rate_limit
             reloaded += 1
     logger.info("Reloaded %d pending posts from database", reloaded)
 
@@ -72,95 +81,111 @@ def remove_scheduled_post(post_id: int):
 
 
 async def publish_post(post_id: int):
-    """Publish a post to the Telegram channel."""
-    post = database.get_post(post_id)
-    if not post:
-        logger.error("Post #%d not found in database", post_id)
-        return
+    """Publish a post to the Telegram channel with rate-limiting protection."""
+    global last_published_time
 
-    if post["status"] != "pending":
-        logger.info("Post #%d is no longer pending (status: %s), skipping", post_id, post["status"])
-        return
+    async with publish_lock:
+        post = database.get_post(post_id)
+        if not post:
+            logger.error("Post #%d not found in database", post_id)
+            return
 
-    try:
-        media_type = post.get("media_type", "photo")
-        caption = post["caption"]
-        media_file_id = post.get("media_file_id")
+        if post["status"] != "pending":
+            logger.info("Post #%d is no longer pending (status: %s), skipping", post_id, post["status"])
+            return
 
-        # Deserialize entities from JSON if available
-        entities = None
-        entities_json = post.get("caption_entities")
-        if entities_json:
+        # Enforce rate limit gap between channel posts
+        tz = pytz.timezone(config.TIMEZONE)
+        now = datetime.now(tz)
+        rate_limit = database.get_rate_limit()
+        if last_published_time is not None:
+            elapsed = (now - last_published_time).total_seconds()
+            if elapsed < rate_limit:
+                wait_time = rate_limit - elapsed
+                logger.info("Rate limit in effect (limit=%ds): waiting %.1fs before publishing post #%d", rate_limit, wait_time, post_id)
+                await asyncio.sleep(wait_time)
+
+        try:
+            media_type = post.get("media_type", "photo")
+            caption = post["caption"]
+            media_file_id = post.get("media_file_id")
+
+            # Deserialize entities from JSON if available
+            entities = None
+            entities_json = post.get("caption_entities")
+            if entities_json:
+                try:
+                    entities_list = json.loads(entities_json)
+                    entities = [MessageEntity.de_json(e, bot) for e in entities_list]
+                except (json.JSONDecodeError, Exception) as e:
+                    logger.warning("Failed to deserialize entities for post #%d: %s", post_id, e)
+
+            if media_type == "photo" and media_file_id:
+                if entities:
+                    await bot.send_photo(
+                        chat_id=config.CHANNEL_ID,
+                        photo=media_file_id,
+                        caption=caption,
+                        caption_entities=entities,
+                    )
+                else:
+                    await bot.send_photo(
+                        chat_id=config.CHANNEL_ID,
+                        photo=media_file_id,
+                        caption=caption,
+                        parse_mode="HTML",
+                    )
+            elif media_type == "video" and media_file_id:
+                if entities:
+                    await bot.send_video(
+                        chat_id=config.CHANNEL_ID,
+                        video=media_file_id,
+                        caption=caption,
+                        caption_entities=entities,
+                    )
+                else:
+                    await bot.send_video(
+                        chat_id=config.CHANNEL_ID,
+                        video=media_file_id,
+                        caption=caption,
+                        parse_mode="HTML",
+                    )
+            else:
+                # Text-only post
+                if entities:
+                    await bot.send_message(
+                        chat_id=config.CHANNEL_ID,
+                        text=caption,
+                        entities=entities,
+                    )
+                else:
+                    await bot.send_message(
+                        chat_id=config.CHANNEL_ID,
+                        text=caption,
+                        parse_mode="HTML",
+                    )
+
+            database.mark_posted(post_id)
+            last_published_time = datetime.now(tz)
+            logger.info("✅ Published post #%d to channel %s", post_id, config.CHANNEL_ID)
+
+            # Notify admin
             try:
-                entities_list = json.loads(entities_json)
-                entities = [MessageEntity.de_json(e, bot) for e in entities_list]
-            except (json.JSONDecodeError, Exception) as e:
-                logger.warning("Failed to deserialize entities for post #%d: %s", post_id, e)
-
-        if media_type == "photo" and media_file_id:
-            if entities:
-                await bot.send_photo(
-                    chat_id=config.CHANNEL_ID,
-                    photo=media_file_id,
-                    caption=caption,
-                    caption_entities=entities,
-                )
-            else:
-                await bot.send_photo(
-                    chat_id=config.CHANNEL_ID,
-                    photo=media_file_id,
-                    caption=caption,
-                    parse_mode="HTML",
-                )
-        elif media_type == "video" and media_file_id:
-            if entities:
-                await bot.send_video(
-                    chat_id=config.CHANNEL_ID,
-                    video=media_file_id,
-                    caption=caption,
-                    caption_entities=entities,
-                )
-            else:
-                await bot.send_video(
-                    chat_id=config.CHANNEL_ID,
-                    video=media_file_id,
-                    caption=caption,
-                    parse_mode="HTML",
-                )
-        else:
-            # Text-only post
-            if entities:
                 await bot.send_message(
-                    chat_id=config.CHANNEL_ID,
-                    text=caption,
-                    entities=entities,
+                    chat_id=config.ADMIN_USER_ID,
+                    text=f"✅ Post #{post_id} has been published to the channel!",
                 )
-            else:
+            except Exception:
+                pass  # Don't fail if admin notification fails
+
+        except Exception as e:
+            logger.error("❌ Failed to publish post #%d: %s", post_id, e)
+            # Notify admin about failure
+            try:
                 await bot.send_message(
-                    chat_id=config.CHANNEL_ID,
-                    text=caption,
-                    parse_mode="HTML",
+                    chat_id=config.ADMIN_USER_ID,
+                    text=f"❌ Failed to publish post #{post_id}!\nError: {e}",
                 )
+            except Exception:
+                pass
 
-        database.mark_posted(post_id)
-        logger.info("✅ Published post #%d to channel %s", post_id, config.CHANNEL_ID)
-
-        # Notify admin
-        try:
-            await bot.send_message(
-                chat_id=config.ADMIN_USER_ID,
-                text=f"✅ Post #{post_id} has been published to the channel!",
-            )
-        except Exception:
-            pass  # Don't fail if admin notification fails
-
-    except Exception as e:
-        logger.error("❌ Failed to publish post #%d: %s", post_id, e)
-        # Notify admin about failure
-        try:
-            await bot.send_message(
-                chat_id=config.ADMIN_USER_ID,
-                text=f"❌ Failed to publish post #{post_id}!\nError: {e}",
-            )
-        except Exception:
-            pass

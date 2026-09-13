@@ -2,6 +2,7 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta
+from typing import Optional
 
 import pytz
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -123,6 +124,107 @@ def build_minute_keyboard():
     return InlineKeyboardMarkup(buttons)
 
 
+# ── Duration & Rate Limit helpers ────────────────────────────────────────
+def format_duration(seconds: int) -> str:
+    """Format seconds into a human-friendly string (e.g. 90 -> '1 min 30 sec')."""
+    if seconds < 60:
+        return f"{seconds} sec"
+    minutes = seconds // 60
+    rem = seconds % 60
+    if rem == 0:
+        return f"{minutes} min" if minutes == 1 else f"{minutes} mins"
+    return f"{minutes} min {rem} sec"
+
+
+def parse_duration(text: str) -> Optional[int]:
+    """Parse text into seconds. Supports: '90', '90s', '1m 30s', '1m30s', '1 min 30 sec', '2m', etc."""
+    text = text.strip().lower()
+    if text.isdigit():
+        return int(text)
+
+    # e.g., "90s", "90 sec", "90 seconds"
+    m = re.match(r"^(\d+)\s*(?:s|sec|secs|second|seconds)$", text)
+    if m:
+        return int(m.group(1))
+
+    # e.g., "1m 30s", "1m30s", "1 min 30 sec", "1 minute 30 seconds"
+    m = re.match(r"^(\d+)\s*(?:m|min|mins|minute|minutes)\s*(?:and\s*)?(\d+)?\s*(?:s|sec|secs|second|seconds)?$", text)
+    if m:
+        mins = int(m.group(1))
+        secs = int(m.group(2)) if m.group(2) else 0
+        return mins * 60 + secs
+
+    # e.g., "1.5m", "1.5 min"
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)$", text)
+    if m:
+        return int(float(m.group(1)) * 60)
+
+    return None
+
+
+def ensure_rate_limit_slot(target_time: datetime, rate_limit: int, exclude_post_id: int = None) -> tuple[datetime, bool, Optional[dict]]:
+    """
+    Ensure target_time has at least `rate_limit` seconds distance from all other pending posts.
+    If there is a conflict, push forward until a clear slot is found.
+    Returns (scheduled_time, was_adjusted, conflicting_post).
+    """
+    tz = get_tz()
+    pending = database.get_pending_posts()
+
+    scheduled_posts = []
+    for p in pending:
+        if exclude_post_id and p["id"] == exclude_post_id:
+            continue
+        p_dt = datetime.fromisoformat(p["scheduled_time"])
+        if p_dt.tzinfo is None:
+            p_dt = tz.localize(p_dt)
+        scheduled_posts.append((p_dt, p))
+    scheduled_posts.sort(key=lambda x: x[0])
+
+    adjusted = False
+    first_conflict = None
+    curr_time = target_time
+
+    max_loops = 100
+    loop = 0
+    while loop < max_loops:
+        conflict_found = False
+        for p_dt, p in scheduled_posts:
+            diff = (curr_time - p_dt).total_seconds()
+            if abs(diff) < rate_limit:
+                conflict_found = True
+                adjusted = True
+                if first_conflict is None:
+                    first_conflict = p
+                curr_time = p_dt + timedelta(seconds=rate_limit)
+                break
+        if not conflict_found:
+            break
+        loop += 1
+
+    return curr_time, adjusted, first_conflict
+
+
+def build_ratelimit_keyboard():
+    """Build preset rate limit options."""
+    buttons = [
+        [
+            InlineKeyboardButton("⚡ 30 sec", callback_data="rl_30"),
+            InlineKeyboardButton("⏱️ 1 min", callback_data="rl_60"),
+        ],
+        [
+            InlineKeyboardButton("🛡️ 1m 30s", callback_data="rl_90"),
+            InlineKeyboardButton("⏳ 2 min", callback_data="rl_120"),
+        ],
+        [
+            InlineKeyboardButton("🕒 5 min", callback_data="rl_300"),
+            InlineKeyboardButton("🛑 10 min", callback_data="rl_600"),
+        ],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+
 # ── Natural language time parser ─────────────────────────────────────────
 def parse_natural_time(text: str) -> datetime | None:
     """Parse natural language time like 'today 3pm', 'tomorrow 10:30am', 'in 2h'."""
@@ -172,13 +274,15 @@ def parse_natural_time(text: str) -> datetime | None:
 # ── /start command ───────────────────────────────────────────────────────
 @admin_only
 async def cmd_start(update: Update, context):
+    rate_limit = database.get_rate_limit()
     await update.message.reply_text(
         "👋 <b>Welcome to the Channel Scheduler Bot!</b>\n\n"
-        "I can schedule posts to your Telegram channel.\n\n"
+        "I can schedule posts to your Telegram channel safely.\n\n"
         "<b>Commands:</b>\n"
         "/newpost — Schedule a new post\n"
         "/list — View all pending posts\n"
         "/cancel <code>&lt;id&gt;</code> — Cancel a scheduled post\n"
+        f"/ratelimit — Set minimum delay between posts (current: {format_duration(rate_limit)})\n"
         "/help — Show this message\n\n"
         "✨ <b>Supports:</b> Bold, italic, links, premium emoji, photos, videos & text-only posts!",
         parse_mode="HTML",
@@ -189,6 +293,7 @@ async def cmd_start(update: Update, context):
 @admin_only
 async def cmd_help(update: Update, context):
     tz = config.TIMEZONE
+    rate_limit = database.get_rate_limit()
     await update.message.reply_text(
         "📖 <b>How to schedule a post:</b>\n\n"
         "1️⃣ Send /newpost\n"
@@ -200,8 +305,10 @@ async def cmd_help(update: Update, context):
         "   • <code>tomorrow 10:30am</code>\n"
         "   • <code>in 2h</code> or <code>in 30m</code>\n"
         f"   • <code>2026-09-15 14:30</code>\n\n"
-        f"⏰ Timezone: {tz}\n\n"
+        f"⏰ Timezone: {tz}\n"
+        f"🛡️ Rate limit: {format_duration(rate_limit)} (change with /ratelimit)\n\n"
         "📋 /list — See all scheduled posts\n"
+        "⏱️ /ratelimit — Adjust delay between posts (e.g. <code>/ratelimit 1m 30s</code>)\n"
         "❌ /cancel <code>&lt;id&gt;</code> — Cancel a post by ID\n"
         "🚫 /done — Cancel current operation",
         parse_mode="HTML",
@@ -399,30 +506,39 @@ async def handle_minute_pick(update: Update, context):
         )
         return WAITING_TIME
 
+    # Ensure slot obeys rate limit
+    rate_limit = database.get_rate_limit()
+    final_time, was_adjusted, conflict = ensure_rate_limit_slot(scheduled_time, rate_limit)
+
     # Save to database
     post_id = database.add_post(
         caption=data["caption"],
-        scheduled_time=scheduled_time,
+        scheduled_time=final_time,
         media_file_id=data.get("media_file_id"),
         media_type=data.get("media_type", "none"),
         caption_entities=data.get("caption_entities"),
     )
 
     # Schedule the job
-    sched_module.schedule_post(post_id, scheduled_time)
+    sched_module.schedule_post(post_id, final_time)
 
     # Clean up
     del user_data_store[user_id]
 
-    formatted_time = scheduled_time.strftime("%b %d, %Y at %I:%M %p")
+    formatted_time = final_time.strftime("%b %d, %Y at %I:%M %p")
     media_type = data.get("media_type", "none")
     media_label = {"photo": "📸 Photo", "video": "📹 Video", "none": "📝 Text-only"}.get(media_type, "📝 Text-only")
+
+    rate_note = ""
+    if was_adjusted and conflict:
+        rate_note = f"\n\n🛡️ <i>Auto-spaced by {format_duration(rate_limit)} rate limit (spaced out to avoid overlapping Post #{conflict['id']}).</i>"
 
     await query.edit_message_text(
         f"✅ <b>Post #{post_id} scheduled!</b>\n\n"
         f"📅 {formatted_time}\n"
         f"📎 {media_label}\n"
-        f"📢 Channel: <code>{config.CHANNEL_ID}</code>\n\n"
+        f"📢 Channel: <code>{config.CHANNEL_ID}</code>"
+        f"{rate_note}\n\n"
         "Send /newpost to schedule another post.\n"
         "Send /list to see all pending posts.",
         parse_mode="HTML",
@@ -464,28 +580,37 @@ async def receive_time_text(update: Update, context):
         )
         return WAITING_TIME
 
+    # Ensure slot obeys rate limit
+    rate_limit = database.get_rate_limit()
+    final_time, was_adjusted, conflict = ensure_rate_limit_slot(scheduled_time, rate_limit)
+
     # Save to database
     data = user_data_store[user_id]
     post_id = database.add_post(
         caption=data["caption"],
-        scheduled_time=scheduled_time,
+        scheduled_time=final_time,
         media_file_id=data.get("media_file_id"),
         media_type=data.get("media_type", "none"),
         caption_entities=data.get("caption_entities"),
     )
 
-    sched_module.schedule_post(post_id, scheduled_time)
+    sched_module.schedule_post(post_id, final_time)
     del user_data_store[user_id]
 
-    formatted_time = scheduled_time.strftime("%b %d, %Y at %I:%M %p")
+    formatted_time = final_time.strftime("%b %d, %Y at %I:%M %p")
     media_type = data.get("media_type", "none")
     media_label = {"photo": "📸 Photo", "video": "📹 Video", "none": "📝 Text-only"}.get(media_type, "📝 Text-only")
+
+    rate_note = ""
+    if was_adjusted and conflict:
+        rate_note = f"\n\n🛡️ <i>Auto-spaced by {format_duration(rate_limit)} rate limit (spaced out to avoid overlapping Post #{conflict['id']}).</i>"
 
     await update.message.reply_text(
         f"✅ <b>Post #{post_id} scheduled!</b>\n\n"
         f"📅 {formatted_time}\n"
         f"📎 {media_label}\n"
-        f"📢 Channel: <code>{config.CHANNEL_ID}</code>\n\n"
+        f"📢 Channel: <code>{config.CHANNEL_ID}</code>"
+        f"{rate_note}\n\n"
         "Send /newpost to schedule another post.\n"
         "Send /list to see all pending posts.",
         parse_mode="HTML",
@@ -554,6 +679,75 @@ async def cmd_cancel(update: Update, context):
         )
 
 
+# ── /ratelimit command ───────────────────────────────────────────────────
+@admin_only
+async def cmd_ratelimit(update: Update, context):
+    """View or change the minimum delay between posts."""
+    if context.args:
+        arg_text = " ".join(context.args)
+        seconds = parse_duration(arg_text)
+        if seconds is None:
+            await update.message.reply_text(
+                "❌ <b>Could not parse time format.</b>\n\n"
+                "<b>Valid examples:</b>\n"
+                "• <code>/ratelimit 1m 30s</code>\n"
+                "• <code>/ratelimit 30s</code>\n"
+                "• <code>/ratelimit 2m</code>\n"
+                "• <code>/ratelimit 90</code> (seconds)",
+                parse_mode="HTML",
+            )
+            return
+
+        if seconds < 10:
+            await update.message.reply_text(
+                "⚠️ Minimum rate limit is <b>10 seconds</b> to keep your Telegram account safe from spam detection.",
+                parse_mode="HTML",
+            )
+            return
+
+        database.set_rate_limit(seconds)
+        formatted = format_duration(seconds)
+        await update.message.reply_text(
+            f"✅ <b>Rate limit updated!</b>\n\n"
+            f"Minimum delay between channel posts is now: <b>{formatted}</b> ({seconds}s).\n\n"
+            f"Posts to <code>{config.CHANNEL_ID}</code> will always be spaced at least {formatted} apart.",
+            parse_mode="HTML",
+        )
+        return
+
+    current = database.get_rate_limit()
+    formatted = format_duration(current)
+    await update.message.reply_text(
+        f"⏱️ <b>Post Rate Limit / Interval Settings</b>\n\n"
+        f"Current minimum delay: <b>{formatted}</b> ({current}s)\n\n"
+        f"This protects your Telegram account by ensuring posts to <code>{config.CHANNEL_ID}</code> are never sent too rapidly.\n\n"
+        "👇 <b>Select a preset below or type a custom time:</b>\n"
+        "<i>e.g. <code>/ratelimit 1m 30s</code> or <code>/ratelimit 45s</code></i>",
+        parse_mode="HTML",
+        reply_markup=build_ratelimit_keyboard(),
+    )
+
+
+async def handle_ratelimit_pick(update: Update, context):
+    """Handle preset rate limit button clicks."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != config.ADMIN_USER_ID:
+        return
+
+    seconds = int(query.data.replace("rl_", ""))
+    database.set_rate_limit(seconds)
+    formatted = format_duration(seconds)
+
+    await query.edit_message_text(
+        f"✅ <b>Rate limit updated!</b>\n\n"
+        f"Minimum delay between channel posts is now: <b>{formatted}</b> ({seconds}s).\n\n"
+        f"Posts to <code>{config.CHANNEL_ID}</code> will always be spaced at least {formatted} apart to keep your account safe.",
+        parse_mode="HTML",
+    )
+
+
 # ── Post-init callback (scheduler setup) ────────────────────────────────
 async def post_init(application):
     """Called after the bot application is initialized."""
@@ -596,11 +790,15 @@ def main():
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("ratelimit", cmd_ratelimit))
+    app.add_handler(CommandHandler("delay", cmd_ratelimit))
+    app.add_handler(CallbackQueryHandler(handle_ratelimit_pick, pattern=r"^rl_"))
 
     logger.info("🤖 Bot is starting...")
     logger.info("Channel: %s", config.CHANNEL_ID)
     logger.info("Admin user ID: %s", config.ADMIN_USER_ID)
     logger.info("Timezone: %s", config.TIMEZONE)
+    logger.info("Current rate limit: %ds", database.get_rate_limit())
     app.run_polling(drop_pending_updates=True)
 
 

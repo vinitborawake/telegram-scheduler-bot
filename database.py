@@ -14,7 +14,7 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_db():
-    """Create the scheduled_posts table if it doesn't exist."""
+    """Create tables if they don't exist and run necessary migrations."""
     conn = get_connection()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS scheduled_posts (
@@ -28,8 +28,63 @@ def init_db():
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    # Migrations: ensure columns exist in scheduled_posts
+    cursor = conn.execute("PRAGMA table_info(scheduled_posts)")
+    columns = [row["name"] for row in cursor.fetchall()]
+    if "caption_entities" not in columns:
+        try:
+            conn.execute("ALTER TABLE scheduled_posts ADD COLUMN caption_entities TEXT")
+        except Exception:
+            pass
+    if "media_type" not in columns:
+        try:
+            conn.execute("ALTER TABLE scheduled_posts ADD COLUMN media_type TEXT NOT NULL DEFAULT 'photo'")
+        except Exception:
+            pass
+    if "media_file_id" not in columns:
+        try:
+            conn.execute("ALTER TABLE scheduled_posts ADD COLUMN media_file_id TEXT")
+        except Exception:
+            pass
     conn.commit()
     conn.close()
+
+
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    """Retrieve a setting by key."""
+    conn = get_connection()
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str):
+    """Set or update a setting by key."""
+    conn = get_connection()
+    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+    conn.commit()
+    conn.close()
+
+
+def get_rate_limit() -> int:
+    """Get the rate limit in seconds (default: 90 seconds = 1m 30s)."""
+    val = get_setting("rate_limit_seconds", "90")
+    try:
+        return max(10, int(val))
+    except ValueError:
+        return 90
+
+
+def set_rate_limit(seconds: int):
+    """Set the rate limit in seconds."""
+    set_setting("rate_limit_seconds", str(max(10, seconds)))
+
 
 
 def add_post(caption: str, scheduled_time: datetime, media_file_id: str = None, media_type: str = "none", caption_entities: str = None) -> int:
